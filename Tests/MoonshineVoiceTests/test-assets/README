@@ -1,0 +1,4 @@
+Upstream removed its test assets from git in v0.0.24 but kept .copy("test-assets")
+in Package.swift, so the test target cannot build without this directory. Tests that
+need a model or WAV either download it (MOONSHINE_DOWNLOAD_TESTS=1) or are skipped/fail
+without local assets placed here.
