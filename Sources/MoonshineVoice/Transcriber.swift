@@ -14,6 +14,8 @@ public class Transcriber {
     private let modelPath: String
     private let modelArch: ModelArch
     private var defaultStream: Stream? = nil
+    private let closeLock = NSLock()
+    private var isClosed_ = false
 
     /// Moonshine header version constant.
     public static let moonshineHeaderVersion: Int32 = 30000
@@ -76,9 +78,33 @@ public class Transcriber {
         close()
     }
 
-    /// Free the transcriber resources.
+    /// Free the transcriber resources: its native engine, and the ONNX Runtime
+    /// sessions and thread pools that engine holds.
+    ///
+    /// Safe to call more than once; only the first call frees anything. That
+    /// matters because the native layer hands a freed handle's ID to the next
+    /// transcriber it loads, so a second free could release someone else's
+    /// engine. Do not call it while another call on this transcriber or its
+    /// streams is in flight.
     public func close() {
+        closeLock.lock()
+        let wasClosed = isClosed_
+        isClosed_ = true
+        closeLock.unlock()
+        guard !wasClosed else { return }
+
+        // The stream before the transcriber that owns it, as the C API's own
+        // example orders them.
+        defaultStream?.close()
+        defaultStream = nil
         api.freeTranscriber(handle)
+    }
+
+    /// Whether ``close()`` has been called.
+    public var isClosed: Bool {
+        closeLock.lock()
+        defer { closeLock.unlock() }
+        return isClosed_
     }
 
     /// Transcribe audio data without streaming.
@@ -187,9 +213,21 @@ public class Transcriber {
 
     /// Get the default stream handle.
     public func getDefaultStream() throws -> Stream {
+        if isClosed {
+            throw MoonshineError.invalidHandle(message: "Transcriber is closed")
+        }
         if defaultStream == nil {
             do {
-                defaultStream = try createStream()
+                // The transcriber holds its default stream, so the stream must not
+                // hold the transcriber back: that cycle kept every transcriber that
+                // ever started, and its native engine, alive until the process
+                // exited, because deinit (and so close()) never ran.
+                let streamHandle = try api.createStream(transcriberHandle: handle, flags: 0)
+                defaultStream = Stream(
+                    transcriber: self,
+                    handle: streamHandle,
+                    retainsTranscriber: false
+                )
             } catch {
                 throw MoonshineError.custom(message: "Failed to create default stream", code: -1)
             }

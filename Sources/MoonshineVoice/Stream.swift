@@ -18,9 +18,15 @@ private let maxUpdateIntervalFactor: Double = 10
 
 /// A stream for real-time transcription with event-based updates.
 public class Stream {
-    private let transcriber: Transcriber
+    private let transcriberHandle: Int32
+    /// Keeps the transcriber alive for a stream made with
+    /// ``Transcriber/createStream(updateInterval:flags:transcribeFlags:)``, which may
+    /// outlive every other reference to it. Nil for the transcriber's own default
+    /// stream: the transcriber holds that one, and closes it before freeing itself.
+    private let owner: Transcriber?
     private let api: MoonshineAPI
     private let handle: Int32
+    private var isClosed = false
     private let updateInterval: TimeInterval
     private let transcribeFlags: UInt32
 
@@ -36,9 +42,11 @@ public class Stream {
         handle: Int32,
         updateInterval: TimeInterval = 0.5,
         flags: UInt32 = 0,
-        transcribeFlags: UInt32 = 0
+        transcribeFlags: UInt32 = 0,
+        retainsTranscriber: Bool = true
     ) {
-        self.transcriber = transcriber
+        self.transcriberHandle = transcriber.handle
+        self.owner = retainsTranscriber ? transcriber : nil
         self.api = MoonshineAPI.shared
         self.handle = handle
         self.updateInterval = updateInterval
@@ -52,15 +60,17 @@ public class Stream {
     
     /// Start the stream.
     public func start() throws {
-        try api.startStream(transcriberHandle: transcriber.handle, streamHandle: handle)
+        try checkOpen()
+        try api.startStream(transcriberHandle: transcriberHandle, streamHandle: handle)
         isActive_ = true
     }
-    
+
     /// Stop the stream.
     /// This will process any remaining audio and emit final events.
     public func stop() throws {
         isActive_ = false
-        try api.stopStream(transcriberHandle: transcriber.handle, streamHandle: handle)
+        try checkOpen()
+        try api.stopStream(transcriberHandle: transcriberHandle, streamHandle: handle)
         // There may be some audio left in the stream, so we need to transcribe it
         // to get the final transcript and emit events. We OR in the
         // stream's default ``transcribeFlags`` so spelling-mode (when
@@ -99,7 +109,7 @@ public class Stream {
             return
         }
         try api.addAudioToStream(
-            transcriberHandle: transcriber.handle,
+            transcriberHandle: transcriberHandle,
             streamHandle: handle,
             audioData: audioData,
             sampleRate: sampleRate,
@@ -125,9 +135,10 @@ public class Stream {
     /// - Returns: The current transcript
     @discardableResult
     public func updateTranscription(flags: UInt32 = 0) throws -> Transcript {
+        try checkOpen()
         let started = DispatchTime.now().uptimeNanoseconds
         let transcript = try api.transcribeStream(
-            transcriberHandle: transcriber.handle,
+            transcriberHandle: transcriberHandle,
             streamHandle: handle,
             flags: flags
         )
@@ -185,13 +196,29 @@ public class Stream {
     }
     
     /// Close the stream and free its resources.
+    ///
+    /// Safe to call more than once; only the first call frees anything, since the
+    /// native layer reuses a freed stream's ID.
     public func close() {
-        do {
-            try api.freeStream(transcriberHandle: transcriber.handle, streamHandle: handle)
-        } catch {
-            // Ignore errors during cleanup
+        guard !isClosed else { return }
+        isClosed = true
+        isActive_ = false
+        // A stream whose transcriber is already closed went with it, and its
+        // handles may belong to a newer transcriber by now.
+        if owner?.isClosed != true {
+            do {
+                try api.freeStream(transcriberHandle: transcriberHandle, streamHandle: handle)
+            } catch {
+                // Ignore errors during cleanup
+            }
         }
         removeAllListeners()
+    }
+
+    private func checkOpen() throws {
+        if isClosed {
+            throw MoonshineError.invalidHandle(message: "Stream is closed")
+        }
     }
 
     public func getHandle() -> Int32 {
